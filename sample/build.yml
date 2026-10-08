@@ -1,0 +1,30 @@
+# Drop into every app repo at: .github/workflows/build.yml — then just push.
+
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]          # push a v1.2.0 tag -> APK attached to a GitHub Release
+  workflow_dispatch:       # manual "Run workflow" button
+
+permissions:
+  contents: write          # needed only for create-release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    uses: JAVIYARAJ/ci-workflows/.github/workflows/android-build.yml@v1
+    with:
+      build-type: release
+      create-release: true
+      # flavor: prod
+      # build-aab: true
+      # split-per-abi: true
+      # flutter-version: 3.35.0
+      # build-number: ${{ github.run_number }}
+      # working-directory: apps/mobile
+    secrets: inherit       # passes KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
