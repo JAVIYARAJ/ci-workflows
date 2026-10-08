@@ -1,0 +1,177 @@
+# Central reusable workflow — lives in: YOUR_GITHUB_USER/ci-workflows/.github/workflows/android-build.yml
+# Auto-detects Flutter (pubspec.yaml) or native Android (gradlew) and builds signed APK/AAB.
+
+name: Android Build (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      build-type:
+        description: "release | debug"
+        type: string
+        default: release
+      flavor:
+        description: "Product flavor (empty = none)"
+        type: string
+        default: ""
+      working-directory:
+        description: "Path to the app inside the repo (for monorepos)"
+        type: string
+        default: "."
+      java-version:
+        type: string
+        default: "17"
+      flutter-version:
+        description: "Exact Flutter version, e.g. 3.35.0 (empty = latest stable)"
+        type: string
+        default: ""
+      build-number:
+        description: "Override versionCode, Flutter only (e.g. github.run_number). Empty = use pubspec"
+        type: string
+        default: ""
+      split-per-abi:
+        description: "Flutter only: produce per-ABI APKs (smaller files)"
+        type: boolean
+        default: false
+      build-aab:
+        description: "Also build an App Bundle for Play Store"
+        type: boolean
+        default: false
+      create-release:
+        description: "Attach outputs to a GitHub Release when triggered by a tag"
+        type: boolean
+        default: false
+      retention-days:
+        type: number
+        default: 14
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+      KEY_PASSWORD:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      BUILD_TYPE: ${{ inputs.build-type }}
+      FLAVOR: ${{ inputs.flavor }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        run: |
+          if [ -f pubspec.yaml ]; then
+            echo "type=flutter"     >> "$GITHUB_OUTPUT"
+            echo "gradle_root=android" >> "$GITHUB_OUTPUT"
+          elif [ -f gradlew ]; then
+            echo "type=native"      >> "$GITHUB_OUTPUT"
+            echo "gradle_root=."    >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No pubspec.yaml or gradlew found in '${{ inputs.working-directory }}'"
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.type == 'flutter'
+        with:
+          channel: stable
+          flutter-version: ${{ inputs.flutter-version }}
+          cache: true
+
+      # Uses AGP's injected-signing hooks (same as Android Studio "Generate Signed APK"),
+      # so no build.gradle / key.properties changes are needed in any project.
+      - name: Configure release signing
+        if: inputs.build-type == 'release' && env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/upload-keystore.jks"
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$KS"
+          GP="${{ steps.detect.outputs.gradle_root }}/gradle.properties"
+          {
+            echo ""
+            echo "android.injected.signing.store.file=$KS"
+            echo "android.injected.signing.store.password=$KEYSTORE_PASSWORD"
+            echo "android.injected.signing.key.alias=$KEY_ALIAS"
+            echo "android.injected.signing.key.password=$KEY_PASSWORD"
+          } >> "$GP"
+          echo "Release signing configured."
+
+      - name: Warn if release is not signed
+        if: inputs.build-type == 'release' && env.HAS_KEYSTORE != 'true'
+        run: echo "::warning::No KEYSTORE_BASE64 secret — Flutter falls back to debug keys, native produces an unsigned APK."
+
+      - name: Build (Flutter)
+        if: steps.detect.outputs.type == 'flutter'
+        env:
+          BUILD_NUMBER: ${{ inputs.build-number }}
+          SPLIT: ${{ inputs.split-per-abi }}
+          AAB: ${{ inputs.build-aab }}
+        run: |
+          ARGS=(--"$BUILD_TYPE")
+          [ -n "$FLAVOR" ]       && ARGS+=(--flavor "$FLAVOR")
+          [ -n "$BUILD_NUMBER" ] && ARGS+=(--build-number "$BUILD_NUMBER")
+          APK_ARGS=("${ARGS[@]}")
+          [ "$SPLIT" = "true" ]  && APK_ARGS+=(--split-per-abi)
+
+          flutter pub get
+          flutter build apk "${APK_ARGS[@]}"
+          [ "$AAB" = "true" ] && flutter build appbundle "${ARGS[@]}"
+          true
+
+      - name: Build (Native)
+        if: steps.detect.outputs.type == 'native'
+        env:
+          AAB: ${{ inputs.build-aab }}
+        run: |
+          cap() { [ -n "$1" ] && echo "$(echo "${1:0:1}" | tr '[:lower:]' '[:upper:]')${1:1}"; }
+          VARIANT="$(cap "$FLAVOR")$(cap "$BUILD_TYPE")"
+          chmod +x gradlew
+          TASKS=("assemble$VARIANT")
+          [ "$AAB" = "true" ] && TASKS+=("bundle$VARIANT")
+          ./gradlew "${TASKS[@]}" --no-daemon --stacktrace
+
+      - name: Collect outputs
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT"
+          find . -path '*/build/*outputs*' \( -name '*.apk' -o -name '*.aab' \) \
+            -not -path '*/intermediates/*' -exec cp {} "$OUT/" \;
+          ls -lh "$OUT"
+          [ -n "$(ls -A "$OUT")" ] || { echo "::error::No APK/AAB produced"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-${{ inputs.build-type }}-${{ github.run_number }}
+          path: ${{ runner.temp }}/out/*
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: inputs.create-release && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/out/*
+          generate_release_notes: true
